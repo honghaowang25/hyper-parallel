@@ -65,5 +65,31 @@ python -m pytest tests/torch/compile/test_dynamic_shapes.py::test_dynamic_causal
 ```
 
 This is a short functional smoke test, not a throughput/convergence benchmark.
-Dynamic PP, arbitrary shape-dependent Python branches, size-0/1 generalization,
-and hot-size graph specialization remain outside the first-stage support.
+Dynamic PP, arbitrary shape-dependent Python branches and size-0/1 generalization
+remain outside the supported path.
+
+## Lazy concrete-size FX graphs
+
+Add the following overrides to the audited command above (or uncomment them in
+the YAML) to exercise lazy generation and dispatch:
+
+```bash
+  '--compile.compile_sizes=[116,118,124,128]' \
+  --compile.compile_size_input=model_inputs.input_ids \
+  --compile.compile_size_dim=1
+```
+
+The first execution uses the general graph. Later configured sizes generate a
+variant once per complete input metadata signature, then reuse it. Other sizes
+use the general graph. `compile.max_specializations` defaults to 8; new signatures
+at capacity also use the general graph. With no `compile_sizes`, behavior is unchanged.
+
+This prototype binds shape expressions and regenerates FX code from the graph
+after parallel passes. It does not rerun model capture, shard parameters again,
+execute collectives while generating a variant, or invoke Inductor/NPU kernel
+compilation. Tensor values, including token counts and weights, stay live inputs.
+
+Audit JSON now includes `specialization` counters and a per-step `dispatch` field.
+When specialization is enabled, the audit also requires generated variants,
+cache hits and at least one folded shape expression. Choose sizes that actually
+recur with your dataset; a different tokenizer or dataset can change packed lengths.

@@ -30,7 +30,8 @@ def _loss(model, x, y):
 
 
 @pytest.mark.parametrize("overlap", [False, True])
-def test_dynamic_fsdp(overlap):
+@pytest.mark.parametrize("specialize", [False, True])
+def test_dynamic_fsdp(overlap, specialize):
     """Compare losses, reduced gradient shards and optimizer updates with eager."""
     dist.init_process_group("gloo", timeout=timedelta(seconds=60))
     try:
@@ -42,11 +43,13 @@ def test_dynamic_fsdp(overlap):
             model, _loss, device=torch.device("cpu"),
             pass_config=PassConfig(fsdp_enabled=True, enable_overlap=overlap),
             dynamic_arg_dims={"x": [0, 1], "y": [0, 1]},
+            compile_sizes=[7, 8] if specialize else None,
+            compile_size_input="x", compile_size_dim=1,
         )
         optimizer = torch.optim.SGD(model.parameters(), lr=1e-2, foreach=False)
         ref_optimizer = torch.optim.SGD(reference.parameters(), lr=1e-2, foreach=False)
         joint = None
-        for batch, sequence in [(2, 5), (3, 7), (4, 3)]:
+        for batch, sequence in [(2, 5), (3, 7), (3, 7), (4, 3)]:
             torch.manual_seed(100 * batch + rank)
             x, y = (torch.randn(batch + rank, sequence + rank, 4) for _ in range(2))
             actual, losses = compiler.forward_backward(x=x, y=y)
@@ -68,5 +71,10 @@ def test_dynamic_fsdp(overlap):
                 torch.testing.assert_close(parameter, ref_parameter.chunk(world_size, dim=0)[rank])
             optimizer.zero_grad()
             ref_optimizer.zero_grad()
+        if specialize:
+            stats = compiler.specialization_stats
+            assert stats["compilations"] == 1, f"Expected one specialization, got {stats}"
+            assert stats["cache_hits"] == 1, f"Expected a cached FSDP execution, got {stats}"
+            assert stats["general_calls"] == 2, f"Expected warmup and cold-size fallback, got {stats}"
     finally:
         dist.destroy_process_group()

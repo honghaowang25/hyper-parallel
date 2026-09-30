@@ -38,6 +38,10 @@ compile:
   enabled: true
   use_joint_graph: true
   dynamic: true
+  # Optional lazy FX specialization (uncomment all three to enable):
+  # compile_sizes: [116, 118, 124, 128]
+  # compile_size_input: model_inputs.input_ids
+  # compile_size_dim: 1
 dataset:
   _target_: hyper_parallel.data.text.build_dataset.build_online_text_dataset
   data_path: ./output/automodel_text_graph/dynamic_text.jsonl

@@ -122,6 +122,10 @@ class CompileConfig:
     dynamo_cache_size_limit: int = 256
     # Joint-graph input paths, e.g. model_inputs.input_ids: [0, 1].
     dynamic_arg_dims: Optional[dict[str, int | list[int]]] = None
+    compile_sizes: Optional[list[int]] = None
+    compile_size_input: Optional[str] = None
+    compile_size_dim: int = -1
+    max_specializations: int = 8
 
     def selects_graph_compiler(self) -> bool:
         """Return whether this config selects the graph-compiler trainer path."""

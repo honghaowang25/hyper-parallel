@@ -166,8 +166,8 @@ instead of the mapping to automatically symbolize all user tensor dimensions.
   both enabled and disabled. The [NPU text example](examples/automodel_text_graph/README.md)
   exercises dynamic token packing through TP2 + FSDP2 with Qwen3-0.6B. Python scalar arguments remain
   constants. Pipeline parallel with dynamic shapes is rejected before tracing.
-  Hot-size specialization, compiled-kernel backends, CUDA/NPU graph capture,
-  serialized graph caches and data-dependent output shapes are not added here.
+  Compiled-kernel backends, CUDA/NPU graph capture, serialized graph caches and
+  data-dependent output shapes are not added here.
 
 Run the focused checks with:
 
@@ -179,6 +179,53 @@ python -m pytest tests/torch/compile/test_dynamic_shapes.py -q
 The approach follows MagiCompiler's separation of dynamic and static dimensions
 and reuse of a general symbolic graph, adapted to HyperParallel's joint-graph
 tracer. It adds no runtime dependency on the separate MagiCompiler checkout.
+
+## Lazy size specialization
+
+Optionally generate concrete-size FX variants of the general joint graph:
+
+```yaml
+compile:
+  enabled: true
+  use_joint_graph: true
+  dynamic: true
+  compile_sizes: [116, 118, 124, 128]
+  compile_size_input: model_inputs.input_ids
+  compile_size_dim: 1
+  max_specializations: 8
+```
+
+`GraphCompiler` and `GraphTrainer` also accept these four options directly.
+`compile_sizes` is opt-in and requires dynamic mode. If `compile_size_input` is
+omitted, selection uses the first symbolic axis among flattened user inputs;
+`compile_size_dim` only applies to an explicit path and supports negative axes.
+
+The first execution uses the general graph, matching MagiCompiler's warmup
+policy. Subsequent configured sizes lazily generate a variant and execute it.
+Repeated signatures hit the cache; unconfigured sizes use the general graph.
+The cache key includes all user tensor shapes, strides, offsets and metadata,
+so another batch dimension at the same sequence length creates a separate
+variant. New signatures at `max_specializations` capacity use the general graph.
+
+General guards run before every dispatch, including cache hits. Guard failures
+still raise errors; specialization does not expand the valid input domain.
+Variants bind pure symbolic shape expressions and regenerate FX code from the
+post-pass graph, without recapturing the model or executing tensor/communication
+operations during generation. Parameters, token counts and RNG remain live.
+This is FX specialization, not an Inductor or NPU kernel compilation backend;
+unresolved expressions remain dynamic and no speedup is promised.
+
+Inspect `compiler.specialization_stats` for compilations, cache hits, general and
+specialized calls, folded nodes and capacity fallbacks. The snapshot counts the
+current compiler instance; variants are not serialized across processes.
+
+```bash
+python -m hyper_parallel.compile.examples.size_specialization
+python -m pytest tests/ut/compile/test_size_specialization.py -q
+```
+
+See [the implementation walkthrough](../../size_specialization_development.md)
+and the [NPU audited training example](examples/automodel_text_graph/README.md).
 
 ## Key Design Decisions
 

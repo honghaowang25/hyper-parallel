@@ -615,6 +615,8 @@ def run_traced_graph(
     joint_graph: JointGraph,
     model: torch.nn.Module,
     inputs: Dict[str, Any],
+    *,
+    graph_dispatcher: Callable | None = None,
 ) -> tuple:
     """
     Execute a traced joint graph against the live model state.
@@ -625,6 +627,9 @@ def run_traced_graph(
     against the stored spec) and appended after the state. Runs under
     ``torch.no_grad()`` because the graph already contains the explicit
     backward ops traced by ``torch.autograd.grad``.
+
+    An optional graph_dispatcher selects a size variant after all input guards
+    pass. It must preserve the general graph's flat input/output contract.
 
     FSDP is invisible here: FSDPPass shards ``model``'s parameters in place,
     so ``model.parameters()`` yields the shards the graph expects as its
@@ -662,7 +667,8 @@ def run_traced_graph(
     flat_inputs = list(state_flat) + list(user_flat)
 
     with torch.no_grad():
-        outputs = joint_graph.graph_module(*flat_inputs)
+        runnable = joint_graph.graph_module if graph_dispatcher is None else graph_dispatcher
+        outputs = runnable(*flat_inputs)
 
     loss_dict_keys = getattr(joint_graph.graph_module, "loss_dict_keys", [])
     num_loss_outputs = len(loss_dict_keys)

@@ -24,7 +24,8 @@ from hyper_parallel.compile import GraphCompiler, PassConfig
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_dynamic_causal_loss_npu(dtype: torch.dtype) -> None:
+@pytest.mark.parametrize("specialize", [False, True])
+def test_dynamic_causal_loss_npu(dtype: torch.dtype, specialize: bool = False) -> None:
     """Compare loss/gradients across lengths without specializing native NPU pad."""
     # The NPU extension is optional on CPU/GPU test hosts.
     pytest.importorskip("torch_npu")
@@ -39,9 +40,10 @@ def test_dynamic_causal_loss_npu(dtype: torch.dtype) -> None:
         shifted = torch.nn.functional.pad(y, (0, 1), value=-100)[..., 1:].contiguous()
         return torch.nn.functional.cross_entropy(module(x).float().flatten(0, 1), shifted.flatten())
 
-    compiler = GraphCompiler(model, causal_loss, pass_config=PassConfig(fsdp_enabled=False), dynamic=True)
+    compiler = GraphCompiler(model, causal_loss, pass_config=PassConfig(fsdp_enabled=False), dynamic=True,
+                             compile_sizes=[7] if specialize else None, compile_size_input="x", compile_size_dim=1)
     with patch.object(compiler, "compile", wraps=compiler.compile) as compile_spy:
-        for length in (5, 7, 11):
+        for length in (5, 7, 7, 11):
             x, y = (torch.randint(0, 32, (1, length), device=device) for _ in range(2))
             y[0, -2] = -100
             model.zero_grad()
@@ -52,9 +54,14 @@ def test_dynamic_causal_loss_npu(dtype: torch.dtype) -> None:
             for parameter, gradient in zip(model.parameters(), gradients):
                 torch.testing.assert_close(parameter.grad, gradient)
         assert compile_spy.call_count == 1, f"Expected one graph capture, got {compile_spy.call_count}"
+    if specialize:
+        stats = compiler.specialization_stats
+        assert stats["compilations"] == 1 and stats["cache_hits"] == 1, f"Invalid specialization dispatch: {stats}"
+        assert stats["folded_nodes"] > 0, f"Expected concrete shape expressions: {stats}"
 
 
 def run_dynamic_causal_loss_npu() -> None:
     """Run both dtypes without a distributed process group or rendezvous port."""
     for dtype in (torch.float32, torch.bfloat16):
-        test_dynamic_causal_loss_npu(dtype)
+        for specialize in (False, True):
+            test_dynamic_causal_loss_npu(dtype, specialize)
