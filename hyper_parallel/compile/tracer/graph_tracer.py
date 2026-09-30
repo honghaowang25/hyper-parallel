@@ -63,11 +63,14 @@ from typing import Any, Dict, List
 
 import torch
 from torch import nn
+from torch._decomp import get_decompositions
 from torch._guards import tracing, TracingContext
 from torch._subclasses import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.fx.traceback import preserve_node_meta
 from torch.nn.utils import stateless
+
+from .dynamic_shapes import DynamicArgDims, InputGuards, build_symbolic_inputs
 
 # Older torch's make_fx predates record_stack_traces / record_module_stack
 # and rejects unknown kwargs; forward only the kwargs this torch supports.
@@ -172,6 +175,7 @@ class JointGraph:
     # runtime parameter state into the graph.
     state_fqns: List[str]
     example_inputs: tuple
+    input_guards: InputGuards | None = None
 
 
 def extract_module_state(mod: nn.Module) -> Dict[str, torch.Tensor]:
@@ -399,6 +403,9 @@ def trace_model_graph(  # pylint: disable=too-many-locals
     model: torch.nn.Module,
     train_fn: Callable,
     inputs: Dict[str, Any],
+    *,
+    dynamic: bool = False,
+    dynamic_arg_dims: DynamicArgDims | None = None,
 ) -> JointGraph:
     """
     Trace model to generate complete forward + backward graph
@@ -408,17 +415,17 @@ def trace_model_graph(  # pylint: disable=too-many-locals
         train_fn: Training function signature:
             ``train_fn(model, **inputs) -> loss``
         inputs: Model inputs, forwarded to ``train_fn`` as keyword arguments
+        dynamic: Symbolize all user tensor dimensions when no explicit mapping is supplied.
+        dynamic_arg_dims: Dotted input paths to dynamic dimensions (supports negative indices).
+            Providing a mapping enables selective symbolic tracing, even when dynamic is False.
+            Parameters and buffers always remain static.
 
     Returns:
         JointGraph: Joint forward-backward computation graph
 
     Note:
-        Tracing is STATIC-SHAPE: no ``ShapeEnv`` is installed, so the graph
-        bakes the sample tensors' concrete shapes (symbolic ``sym_size``
-        nodes would make per-stage placement ambiguous in ``PpPass``).
-        This contract is shared by ALL graph-mode users, FSDP included — a
-        batch whose shape differs from the compile sample must be
-        re-compiled.
+        Static tracing remains the default. Dynamic traces retain shape guards;
+        incompatible shapes or shape-dependent branches raise before execution.
     """
     # Extract module state (parameters/buffers) into flat tensors threaded
     # through the graph as static inputs (leading placeholders).
@@ -453,15 +460,14 @@ def trace_model_graph(  # pylint: disable=too-many-locals
 
     full_args = list(state_flat) + list(user_inputs_flat)
 
-    # Static shapes: no ShapeEnv -> no symbolic sizes -> the traced graph
-    # carries no aten.sym_size scalar nodes (their CSE-across-phases aliasing
-    # makes per-stage placement ambiguous). The trainer compiles per fixed
-    # batch shape, so static tracing loses nothing here.
-    fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
-    fake_args = tuple(
-        _fakeify_input(fake_mode, a) if isinstance(a, torch.Tensor) else a
-        for a in full_args
-    )
+    if not isinstance(dynamic, bool):
+        raise ValueError("dynamic must be a bool")
+    symbolic = dynamic or dynamic_arg_dims is not None
+    if symbolic:
+        fake_mode, fake_args = build_symbolic_inputs(state_flat, inputs, dynamic_arg_dims)
+    else:
+        fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
+        fake_args = tuple(_fakeify_input(fake_mode, value) for value in full_args)
     num_state_inputs = len(state_flat)
 
     # ``_fwd_bwd_fn`` communicates the traced ``loss_dict`` key order to the
@@ -544,7 +550,12 @@ def trace_model_graph(  # pylint: disable=too-many-locals
         torch.autograd.set_multithreading_enabled(False),
         _non_strict_tracing_context(),
     ):
-        traced_graph = make_fx(_fwd_bwd_fn, **_MAKE_FX_KWARGS)(*fake_args)
+        # Native constant padding can specialize SymInt sizes (notably on
+        # NPU). Its upstream decomposition preserves causal-LM label lengths.
+        decompositions = get_decompositions([torch.ops.aten.constant_pad_nd.default]) if symbolic else None
+        traced_graph = make_fx(
+            _fwd_bwd_fn, decomposition_table=decompositions, **_MAKE_FX_KWARGS
+        )(*fake_args)
 
     # Stock torch's make_fx does not tag backward nodes (no torchtitan
     # ``_patch_engine_backward`` hook), so the joint graph splits into
@@ -593,6 +604,10 @@ def trace_model_graph(  # pylint: disable=too-many-locals
         num_layers=num_layers,
         state_fqns=state_fqns,
         example_inputs=fake_args,
+        input_guards=(
+            InputGuards(user_inputs_flat, fake_args[num_state_inputs:], fake_mode.shape_env)
+            if symbolic else None
+        ),
     )
 
 
@@ -640,6 +655,9 @@ def run_traced_graph(
         )
 
     state_flat, _ = torch.utils._pytree.tree_flatten({"model": model_state})
+
+    if joint_graph.input_guards is not None:
+        joint_graph.input_guards.validate(user_flat)
 
     flat_inputs = list(state_flat) + list(user_flat)
 
