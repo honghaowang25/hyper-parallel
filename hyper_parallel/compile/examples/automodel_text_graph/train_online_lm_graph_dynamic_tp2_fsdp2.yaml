@@ -41,6 +41,10 @@ compile:
   enabled: true
   use_joint_graph: true
   dynamic: true
+  # Optional lazy FX specialization (uncomment all three to enable):
+  # compile_sizes: [116, 120, 127]
+  # compile_size_input: model_inputs.input_ids
+  # compile_size_dim: 1
 dataset:
   # Streaming avoids truncating raw records before dynamic token packing.
   _target_: hyper_parallel.data.text.build_dataset.build_online_iterable_dataset

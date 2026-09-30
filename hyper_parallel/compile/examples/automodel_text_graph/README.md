@@ -35,13 +35,37 @@ interpreter, and use `MASTER_PORT`, `NPROC_PER_NODE` and `OUTPUT_DIR` for launch
 settings. The default YAML remains the indexed/static example. The output is a
 normal training log; this entry does not export a separate per-rank audit JSON.
 
-## Regression tests and implementation notes
+## Optional size specialization
 
-Small-model shape/gradient checks live in the existing CPU UT:
+Add these overrides to the dynamic training command:
 
 ```bash
-python -m pytest tests/ut/compile/test_dynamic_shapes.py -q
+  '--compile.compile_sizes=[116,120,127]' \
+  --compile.compile_size_input=model_inputs.input_ids \
+  --compile.compile_size_dim=1
 ```
 
-These tests check eager loss/gradient parity, graph reuse and guards. CPU UT and mocked communication do not substitute for real NPU training.
+The first execution uses the general graph. Later configured sizes generate an
+FX variant once per complete input metadata signature and reuse it. Other sizes,
+or new signatures at the cache limit, continue using the general graph.
+`compile.max_specializations` defaults to 8. Omit `compile_sizes` to disable variants.
+A different tokenizer or dataset can change which packed lengths recur.
+
+Generation binds shape expressions in the post-pass FX graph. It does not
+recapture the model, shard parameters again, execute collectives during generation
+or invoke an Inductor/NPU kernel compiler. Tensor values, token counts and model
+weights remain runtime inputs. This is a functionality example, not a throughput
+or convergence benchmark.
+
+## Regression tests and implementation notes
+
+Small-model shape/gradient and dispatch checks live in the existing CPU UT:
+
+```bash
+python -m pytest tests/ut/compile/test_dynamic_shapes.py \
+  tests/ut/compile/test_size_specialization.py -q
+```
+
+These tests check eager loss/gradient parity, graph reuse, guards and multiple hot
+sizes. CPU UT and mocked communication do not substitute for real NPU training.
 Dynamic PP and arbitrary data-dependent shapes remain outside the supported path.

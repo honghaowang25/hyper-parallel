@@ -196,6 +196,10 @@ class TestTrainerConfigContracts(unittest.TestCase):
                 ("options", "None"),
                 ("dynamo_cache_size_limit", "256"),
                 ("dynamic_arg_dims", "None"),
+                ("compile_sizes", "None"),
+                ("compile_size_input", "None"),
+                ("compile_size_dim", "-1"),
+                ("max_specializations", "8"),
             ],
         )
 

@@ -1,6 +1,6 @@
 # HyperParallel 静态图动态 Shape 开发说明
 
-本文说明当前联合图的动态输入机制、BaseTrainer 接入和 NPU 文本训练入口。文件链接相对于仓库根目录；链接标注当前源码中的函数名与起始行，便于代码变化后重新定位。
+本文说明当前联合图的动态输入机制、BaseTrainer 接入和 NPU 文本训练入口。文件链接相对于仓库根目录；链接标注当前源码中的函数名与起始行，便于代码变化后重新定位。按尺寸生成专用 FX 图和缓存分派见 [尺寸特化开发说明](size_specialization_development.md)。
 
 动态 shape 允许 batch、sequence 等用户输入维度变化，并复用前向与反向联合 FX 图。 “静态图”指算子拓扑被捕获；图中部分尺寸仍是 `SymInt`，执行对象是并行 Pass 改写后的 `GraphModule`。这项能力不等同于算子融合、NPU Graph capture、任意动态控制流或动态输出尺寸支持。
 
@@ -94,7 +94,7 @@ if joint_graph.input_guards is not None:
 self._joint_graph = joint_graph
 ```
 
-完整实现先执行可能修改真实参数的并行 Pass。 [trace_model_graph:508](hyper_parallel/compile/tracer/graph_tracer.py#L508) 分离模型状态和用户输入：
+节选省略可选尺寸分派初始化；完整实现先校验分派配置，再执行可能修改真实参数的并行 Pass。 [trace_model_graph:508](hyper_parallel/compile/tracer/graph_tracer.py#L508) 分离模型状态和用户输入：
 
 ```text
 输入：[参数与 buffer 的扁平序列] + [用户输入 pytree 的扁平序列]
@@ -167,7 +167,7 @@ backward_loss = cur_loss * cur_token_len / step_len * device_mesh.dp_size * devi
 ```
 
 这里省略日志值的全局归约；捕获路径不通过 `.item()` 做数据依赖的计数分支。
-计数是数值变化的标量 Tensor，不需要新增动态维度。
+计数是数值变化的标量 Tensor，不需要新增动态维度，也不能在尺寸特化时把数值固化。
 [test_basetrainer_token_weights_are_runtime_inputs:354](tests/ut/compile/test_dynamic_shapes.py#L354) 检查计数改变时 loss 和梯度改变且继续复用图。
 
 ## 7. causal padding decomposition
@@ -230,10 +230,11 @@ MoE 内部按 token 路由产生的数据依赖 shape 不会因输入维度符�
 ## 10. 当前回归入口与证据范围
 
 ```bash
-python -m pytest tests/ut/compile/test_dynamic_shapes.py -q
+python -m pytest tests/ut/compile/test_dynamic_shapes.py \
+  tests/ut/compile/test_size_specialization.py -q
 ```
 
-当前 UT 以 CPU 数值对照和 mock distributed 覆盖输入符号化、guards、FSDP 改写与 BaseTrainer 计数。
+当前 UT 以 CPU 数值对照和 mock distributed 覆盖输入符号化、guards、FSDP 改写、BaseTrainer 计数与尺寸分派。
 历史开发运行还验证过多进程 FSDP、NPU causal loss / attention，以及 TP2 + FSDP2 的随机初始化模型变长训练。
 这些记录是指定模型和安装组合的能力证据，不能当作仍维护的持续 ST 入口，也不表示收敛或吞吐验证。
 完整模型尚不能从有限 loss 和完成 optimizer step 推导出逐参数 eager 数值对齐。
