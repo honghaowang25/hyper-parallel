@@ -32,6 +32,7 @@ from typing import Any, Protocol
 
 import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
+from torch.utils._pytree import register_pytree_node
 
 from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
 from hyper_parallel.components.functional.lightning_indexer import (
@@ -223,6 +224,7 @@ class SharedCompressedPackedSequence:
     _prepared_minima: dict[tuple[torch.device, int], torch.Tensor] = field(
         default_factory=dict, init=False, repr=False, compare=False
     )
+    _compression_alignment: dict[int, bool] = field(default_factory=dict, init=False, repr=False, compare=False)
     _compression_rope: dict[int, tuple] = field(default_factory=dict, init=False, repr=False, compare=False)
     _snapshot: dict[str, Any] = field(default_factory=dict, init=False, repr=False, compare=False)
     _prepared_positions: dict[torch.device, torch.Tensor] = field(
@@ -275,6 +277,7 @@ class SharedCompressedPackedSequence:
         self._prepared_starts[device] = starts
         for ratio in set(compress_ratios):
             self.validate_compression_ratio(ratio)
+            self.compression_aligned(ratio)
             if ratio > 0 and (device, ratio) not in self._prepared_minima:
                 self._prepared_minima[(device, ratio)] = self.minimum_key_indices(device, ratio)
 
@@ -375,6 +378,15 @@ class SharedCompressedPackedSequence:
         if compress_ratio < 0:
             raise ValueError("compression ratio must be nonnegative")
 
+    def compression_aligned(self, ratio: int) -> bool:
+        """Cache document alignment before capture while keeping natural lengths valid."""
+        if ratio not in self._compression_alignment:
+            self.validate_compression_ratio(ratio)
+            self._compression_alignment[ratio] = ratio <= 1 or all(
+                boundary % ratio == 0 for boundary in self.boundaries()
+            )
+        return self._compression_alignment[ratio]
+
     def block_plan(self, ratio: int, size: int, rank: int) -> Any:
         """Use the original contiguous compressor fast path when every group is aligned.
 
@@ -387,7 +399,7 @@ class SharedCompressedPackedSequence:
             Document-local block plan, or None when contiguous compression suffices.
         """
         if ratio <= 1 or (self.local_query_length % ratio == 0
-                          and all(boundary % ratio == 0 for boundary in self.boundaries())):
+                          and self.compression_aligned(ratio)):
             return None
         return document_compression_plan(self.boundaries(), ratio, self.local_query_length, size, rank)
 
@@ -420,6 +432,42 @@ class SharedCompressedPackedSequence:
         return tuple((max(first, start)-first, start)
                      for start, end in zip(self.boundaries(), self.boundaries()[1:])
                      if max(first, start) < min(last, end))
+
+    def pytree_flatten(self) -> tuple[list[Any], tuple]:
+        """Expose prepared geometry as graph inputs, never as captured constants."""
+        children = [self.cu_seq_lens, self._prepared_starts, self._prepared_minima,
+                    self._prepared_positions, self._prepared_masks]
+        context = (self.local_query_start, self.local_query_length, self.global_sequence_length,
+                   tuple(sorted(self._compression_alignment.items())))
+        return children, context
+
+    @classmethod
+    def pytree_unflatten(cls, children: Any, context: tuple) -> SharedCompressedPackedSequence:
+        """Reconstruct an owned snapshot without reading tensor data during tracing."""
+        boundaries, starts, minima, positions, masks = children
+        local_start, local_length, global_length, alignment = context
+        sequence = cls(boundaries, local_start, local_length, global_length)
+        sequence._prepared_starts.update(starts)
+        sequence._prepared_minima.update(minima)
+        sequence._prepared_positions.update(positions)
+        sequence._prepared_masks.update(masks)
+        sequence._compression_alignment.update(alignment)
+        sequence._mark_owned()
+        return sequence
+
+
+register_pytree_node(SharedCompressedPackedSequence, SharedCompressedPackedSequence.pytree_flatten,
+                    SharedCompressedPackedSequence.pytree_unflatten)
+
+
+def _query_chunk_ranges(sequence_length: int, chunk_size: int) -> tuple[tuple[int, int], ...]:
+    """Keep a single chunk symbolic instead of coercing its length through range."""
+    if sequence_length == 0:
+        return ()
+    if sequence_length <= chunk_size:
+        return ((0, sequence_length),)
+    return tuple((start, min(start + chunk_size, sequence_length))
+                 for start in range(0, sequence_length, chunk_size))
 
 
 def _rotate_half(tensor: torch.Tensor) -> torch.Tensor:
@@ -574,8 +622,7 @@ def compressed_causal_topk(
     key_fp32 = key.float().transpose(1, 2).unsqueeze(1)
     key_positions = torch.arange(compressed_length, device=query.device).view(1, 1, -1)
     selected_chunks = []
-    for start in range(0, sequence_length, query_chunk_size):
-        end = min(start + query_chunk_size, sequence_length)
+    for start, end in _query_chunk_ranges(sequence_length, query_chunk_size):
         # SAC may retain the matmul result; do not mutate its cached tensor.
         scores = torch.matmul(query[:, start:end].float(), key_fp32).relu()
         scores = (scores * merge_weight[:, start:end].float().unsqueeze(-1)).sum(dim=2)
@@ -683,8 +730,7 @@ def compressed_causal_candidates(
     key_fp32 = key.float().transpose(1, 2).unsqueeze(1)
     key_positions = torch.arange(compressed_length, device=query.device).view(1, 1, -1)
     candidate_chunks = []
-    for start in range(0, sequence_length, query_chunk_size):
-        end = min(start + query_chunk_size, sequence_length)
+    for start, end in _query_chunk_ranges(sequence_length, query_chunk_size):
         scores = torch.matmul(query[:, start:end].float(), key_fp32).relu()
         scores = (scores * merge_weight[:, start:end].float().unsqueeze(-1)).sum(dim=2)
         if reduce_sum is not None:
@@ -753,8 +799,7 @@ def compressed_causal_topk_and_candidates(
     key_positions = torch.arange(compressed_length, device=query.device).view(1, 1, -1)
     selected_chunks = []
     candidate_chunks = []
-    for start in range(0, sequence_length, query_chunk_size):
-        end = min(start + query_chunk_size, sequence_length)
+    for start, end in _query_chunk_ranges(sequence_length, query_chunk_size):
         scores = torch.matmul(query[:, start:end].float(), key_fp32).relu()
         scores = (scores * merge_weight[:, start:end].float().unsqueeze(-1)).sum(dim=2)
         if reduce_sum is not None:
@@ -834,8 +879,7 @@ def compressed_candidate_topk(
     block_offsets = torch.arange(block_size, device=query.device)
     batch_indices = torch.arange(batch_size, device=query.device).view(-1, 1, 1)
     selected_chunks = []
-    for start in range(0, sequence_length, query_chunk_size):
-        end = min(start + query_chunk_size, sequence_length)
+    for start, end in _query_chunk_ranges(sequence_length, query_chunk_size):
         blocks = candidate_blocks[:, start:end].long()
         block_positions = blocks.unsqueeze(-1) * block_size + block_offsets
         positions = block_positions.flatten(-2)
@@ -893,13 +937,10 @@ class _SharedCompressedIndexerKLLoss(torch.autograd.Function):
         grad_merge_weight = torch.zeros_like(merge_weight, dtype=torch.float32)
 
         with torch.no_grad(), torch.autocast(device_type=index_query.device.type, enabled=False):
-            for start in range(0, sequence_length, query_chunk_size):
-                end = min(start + query_chunk_size, sequence_length)
+            for start, end in _query_chunk_ranges(sequence_length, query_chunk_size):
                 selected = topk_indices[:, start:end]
                 valid = selected >= 0
                 valid_rows = valid.any(dim=-1)
-                if not torch.any(valid_rows):
-                    continue
                 safe_indices = selected.clamp_min(0).long()
 
                 query_chunk = index_query[:, start:end].float()
@@ -935,7 +976,9 @@ class _SharedCompressedIndexerKLLoss(torch.autograd.Function):
                 log_prediction = index_scores.log_softmax(dim=-1)
                 target_log = target.clamp_min(torch.finfo(torch.float32).tiny).log()
                 row_loss = (target * (target_log - log_prediction)).sum(dim=-1)
-                total_loss.add_(row_loss[valid_rows].sum() * (loss_coeff / denominator))
+                # Empty causal rows already have zero target and gradients.
+                # Mask their loss without data-dependent Python or indexing.
+                total_loss.add_(row_loss.masked_fill(~valid_rows, 0.0).sum() * (loss_coeff / denominator))
 
                 grad_scores = log_prediction.exp() * target.sum(-1, keepdim=True) - target
                 grad_scores.mul_(loss_coeff / denominator)
@@ -1427,7 +1470,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             query_offset: int,
             global_sequence_length: int,
             device: torch.device,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, tuple]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, tuple | None]:
         """Validate packed document boundaries and derive local Q/K segments."""
         segment_starts = None
         minimum_key_indices = None
@@ -1457,9 +1500,10 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             if self.compress_ratio:
                 minimum_key_indices = packed_sequence.minimum_key_indices(device, self.compress_ratio)
             if (self.candidate_source_layer_idx is not None
-                    and any(boundary % ratio for boundary in packed_sequence.boundaries())):
+                    and not packed_sequence.compression_aligned(ratio)):
                 raise ValueError("candidate-pool packed attention still requires compression-aligned documents")
-            query_segments = packed_sequence.indexer_segments(ratio)
+            # Only fused kernels consume host intervals; reference masks stay live in FX.
+            query_segments = packed_sequence.indexer_segments(ratio) if self.use_fused_ops else None
         return segment_starts, minimum_key_indices, query_segments
 
     def _prepare_compression(
@@ -1524,7 +1568,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             tp_context: "SharedCompressedAttentionTPContext | None",
             query_offset: int,
             minimum_key_indices: torch.Tensor | None,
-            query_segments: tuple,
+            query_segments: tuple | None,
             block_plan: Any = None,
             key_position_embeddings: tuple | None = None,
     ) -> Any | None:
@@ -1602,7 +1646,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             query: torch.Tensor,
             compressed_kv: torch.Tensor | None,
             tp_context: "SharedCompressedAttentionTPContext | None",
-            query_segments: tuple,
+            query_segments: tuple | None,
     ) -> torch.Tensor:
         """Auto-scale the query by the indexer KL loss when configured."""
         if (
@@ -1633,7 +1677,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
     def _run_sparse_attention(
             self, query: torch.Tensor, key_value: torch.Tensor, compressed_kv: torch.Tensor | None,
             topk_indices: torch.Tensor | None, query_offset: int, global_sequence_length: int,
-            segment_starts: torch.Tensor | None, query_segments: tuple, raw_document_starts: tuple = (),
+            segment_starts: torch.Tensor | None, query_segments: tuple | None, raw_document_starts: tuple = (),
     ) -> torch.Tensor:
         """Run the chosen implementation; unsupported explicit fusion always raises."""
         if self.use_fused_ops:
@@ -1722,7 +1766,8 @@ class SharedCompressedDSAAttentionBase(nn.Module):
         block_plan, key_positions = self._prepare_compression(
             packed_sequence, cp_context, position_embeddings, global_sequence_length, hidden_states.device,
         )
-        raw_document_starts = () if packed_sequence is None else packed_sequence.raw_document_starts()
+        raw_document_starts = (packed_sequence.raw_document_starts()
+                               if self.use_fused_ops and packed_sequence is not None else ())
         rope_type = "compress" if self.compress_ratio else "main"
         cos, sin = position_embeddings[rope_type]
         key_value, raw_kv_handle = self._project_raw_kv(hidden_states, cos, sin, cp_context)

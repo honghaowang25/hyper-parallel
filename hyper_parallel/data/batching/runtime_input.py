@@ -115,6 +115,16 @@ class RuntimeInputContext:
 class RuntimeInputAdapter(ABC):
     """Extend a generic batch with model-owned forward inputs."""
 
+    def bind_model_config(self, model_config: Any) -> None:
+        """Bind the final model configuration before the first batch.
+
+        Adapters independent of model configuration keep this no-op.
+
+        Args:
+            model_config: Resolved configuration after model construction.
+        """
+        del model_config
+
     def build(
             self,
             *,

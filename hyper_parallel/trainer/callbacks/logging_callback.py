@@ -14,6 +14,8 @@
 # ============================================================================
 """Per-step structured terminal logging callback."""
 
+from __future__ import annotations
+
 import logging
 from typing import Any
 
@@ -74,7 +76,7 @@ class LoggingCallback(Callback):
         **kwargs: Any,
     ) -> None:
         """Log all shared environment metrics at the configured cadence."""
-        del loss, loss_dict, grad_norm, kwargs
+        del loss, grad_norm, kwargs
         if self.logging_steps <= 0:
             return
         if getattr(self.trainer, "global_rank", 0) != 0:
@@ -86,7 +88,9 @@ class LoggingCallback(Callback):
 
         metrics = dict(getattr(self.trainer, "step_env_metrics", {}))
         moe_monitor = getattr(self.trainer, "moe_monitor", None)
-        aux_loss = moe_monitor.last_mean_aux_loss if moe_monitor is not None else None
+        aux_loss = loss_dict.get("router_aux_loss") if loss_dict is not None else None
+        if aux_loss is None and moe_monitor is not None:
+            aux_loss = moe_monitor.last_mean_aux_loss
         if aux_loss is not None:
             metrics["training/router_aux_loss"] = aux_loss
         if not metrics:

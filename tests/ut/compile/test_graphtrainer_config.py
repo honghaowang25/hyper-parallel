@@ -14,19 +14,17 @@
 # ============================================================================
 """Unit tests for graph-mode integration helpers."""
 
-import os
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
-
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 import torch
 
 from hyper_parallel.compile.compiler import GraphCompiler
 from hyper_parallel.compile.pass_config import PassConfig, build_pass_config_from_trainer_config
 from hyper_parallel.compile.trainer import GraphTrainer
+from hyper_parallel.components.modules.moe_utils import MoEMonitorCallback
 from hyper_parallel.distributed.compile import _resolve_compile_config
 from hyper_parallel.models._transformers.model_builder import instantiate_infrastructure
 from hyper_parallel.models.build_options import CompileConfig
@@ -54,11 +52,14 @@ def _make_kw_model() -> torch.nn.Module:
     """Tiny module following the ``input_ids``/``use_cache`` call protocol."""
 
     class _KWModel(torch.nn.Module):
-        def __init__(self):
+        def __init__(self) -> None:
+            """Initialize the regression fixture."""
             super().__init__()
             self.linear = torch.nn.Linear(4, 4)
 
-        def forward(self, input_ids, use_cache=False):
+        def forward(self, input_ids: torch.Tensor, use_cache: bool = False) -> torch.Tensor:
+            """Evaluate the graph regression fixture."""
+            del use_cache
             return self.linear(input_ids)
 
     return _KWModel()
@@ -66,6 +67,37 @@ def _make_kw_model() -> torch.nn.Module:
 
 class TestGraphModeIntegration(unittest.TestCase):
     """Test graph-mode selection without the old target-wrapping bridge."""
+
+    def test_graph_router_metric_replays_without_python_forward(self) -> None:
+        """Return updated auxiliary metrics through the existing named-output contract."""
+        class RouterMetricModel(torch.nn.Module):
+            def __init__(self) -> None:
+                """Initialize the regression fixture."""
+                super().__init__()
+                self.linear = torch.nn.Linear(4, 4)
+                self.last_aux_loss = None
+
+            def forward(self, input_ids: torch.Tensor, use_cache: bool = False) -> torch.Tensor:
+                """Evaluate the graph regression fixture."""
+                del use_cache
+                outputs = self.linear(input_ids)
+                self.last_aux_loss = outputs.detach().square().mean()
+                return outputs
+
+        base = BaseTrainer.__new__(BaseTrainer)
+        base.model_fwd_context = nullcontext()
+        base.model = RouterMetricModel()
+        base.moe_monitor = MoEMonitorCallback(base.model)
+        base.postforward = lambda outputs, _labels, **_kwargs: (outputs.mean(), {})
+        compiler = GraphCompiler(base.model, base._graph_train_fn,
+                                 pass_config=PassConfig(fsdp_enabled=False), device=torch.device("cpu"))
+        for value in (1., 3.):
+            inputs = torch.full((2, 4), value)
+            with torch.no_grad():
+                expected = base.model.linear(inputs).square().mean()
+            _, metrics = compiler.forward_backward(model_inputs={"input_ids": inputs}, labels=None,
+                                                   current_token_counts={}, step_token_counts={})
+            torch.testing.assert_close(metrics["router_aux_loss"], expected)
 
     def test_basetrainer_builds_graph_compiler_only_for_joint_graph(self):
         """BaseTrainer should own compiler creation without affecting eager mode."""

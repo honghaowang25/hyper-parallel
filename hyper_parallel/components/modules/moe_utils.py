@@ -16,6 +16,7 @@
 
 from typing import TYPE_CHECKING, Optional, Any
 
+import torch
 import torch.distributed as dist
 from torch import nn
 
@@ -156,6 +157,16 @@ class MoEMonitorCallback:
         self.dp_group = dp_group
         self.num_recomputations = num_recomputations
         self._hook_handle = None
+
+    @property
+    def last_mean_aux_loss_tensor(self) -> Optional[torch.Tensor]:
+        """Return the raw router metric without synchronizing or leaving the graph."""
+        aux_losses = [
+            module.last_aux_loss.detach()
+            for module in self.model.modules()
+            if getattr(module, "last_aux_loss", None) is not None
+        ]
+        return torch.stack(aux_losses).mean() if aux_losses else None
 
     @property
     def last_mean_aux_loss(self) -> Optional[float]:

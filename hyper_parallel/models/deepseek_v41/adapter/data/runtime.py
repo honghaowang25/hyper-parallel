@@ -49,6 +49,21 @@ class DeepseekV41Runtime(RuntimeInputAdapter):
         """
         self.include_position_ids = include_position_ids
         self.include_image_sequence_start = include_image_sequence_start
+        self._compress_ratios: tuple[int, ...] | None = None
+
+    def bind_model_config(self, model_config: Any) -> None:
+        """Derive packed preparation from the final model compression ratios.
+
+        Trainer binds this for both eager and joint-graph execution. An
+        unbound standalone adapter retains lazy eager preparation in forward.
+
+        Args:
+            model_config: Final DeepSeek-V4.1 configuration.
+        """
+        ratios = getattr(model_config, "v41_compress_ratios", None)
+        if ratios is None:
+            raise ValueError("DeepseekV41Runtime requires model_config.v41_compress_ratios")
+        self._compress_ratios = tuple(sorted(set(ratios)))
 
     def runtime_input_fields(self) -> tuple[str, ...]:
         """Declare the stable set of model inputs produced by this instance."""
@@ -86,6 +101,11 @@ class DeepseekV41Runtime(RuntimeInputAdapter):
                 global_sequence_length=cp_size * local_sequence_length,
             )
         }
+        if self._compress_ratios is not None:
+            device = batch["input_ids"].device
+            packed = runtime_inputs["packed_seq_params"].prepare(device, self._compress_ratios)
+            packed.segment_start_mask(device)
+            runtime_inputs["packed_seq_params"] = packed
         cp_start = runtime_inputs["packed_seq_params"].local_query_start
         if self.include_position_ids:
             input_ids = batch["input_ids"]

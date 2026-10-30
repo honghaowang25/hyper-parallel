@@ -34,6 +34,11 @@ class EncoderParallelInputAdapter(RuntimeInputAdapter):
         self.runtime = runtime
         self.inner = inner
 
+    def bind_model_config(self, model_config: Any) -> None:
+        """Forward final model configuration to the wrapped input provider."""
+        if self.inner is not None:
+            self.inner.bind_model_config(model_config)
+
     def runtime_input_fields(self) -> tuple[str, ...]:
         """Declare the existing fields and the plan field as one input contract."""
         fields = () if self.inner is None else self.inner.runtime_input_fields()
