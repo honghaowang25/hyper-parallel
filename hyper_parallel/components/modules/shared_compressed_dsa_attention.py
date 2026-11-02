@@ -32,6 +32,7 @@ from typing import Any, Protocol
 
 import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
+from torch.utils._pytree import register_pytree_node  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
 from hyper_parallel.components.functional.lightning_indexer import (
@@ -210,6 +211,34 @@ class SharedCompressedAttentionTPContext:
 
 
 @dataclass(frozen=True)
+class _TensorCompressionPlan:
+    """Fixed-capacity CP1 grouping whose document-dependent indices are graph inputs.
+
+    Extra slots are invisible to every query through its prepared key bounds.
+    They must never be selected as attention keys or KL targets.
+    """
+
+    ratio: int
+    rows: torch.Tensor
+    starts: torch.Tensor
+
+    def pool(self, key: torch.Tensor, gate: torch.Tensor, context: Any) -> torch.Tensor:
+        """Apply the original per-channel FP32 softmax to complete document blocks."""
+        if context is not None:
+            raise ValueError("tensor compression geometry currently supports CP1 only")
+        shape = (key.shape[0], self.starts.shape[0], self.ratio, key.shape[-1])
+        values = key.index_select(1, self.rows).reshape(shape)
+        scores = gate.index_select(1, self.rows).reshape(shape)
+        return (values * scores.float().softmax(dim=2).to(values.dtype)).sum(dim=2)
+
+    def positions(self, cos: torch.Tensor, sin: torch.Tensor, context: Any) -> tuple:
+        """Gather each complete block's original first-token rotary coefficients."""
+        if context is not None:
+            raise ValueError("tensor compression geometry currently supports CP1 only")
+        return cos.index_select(1, self.starts), sin.index_select(1, self.starts)
+
+
+@dataclass(frozen=True)
 class SharedCompressedPackedSequence:
     """Compact sample boundaries for one contiguous CP query shard."""
 
@@ -223,6 +252,7 @@ class SharedCompressedPackedSequence:
     _prepared_minima: dict[tuple[torch.device, int], torch.Tensor] = field(
         default_factory=dict, init=False, repr=False, compare=False
     )
+    _compression_alignment: dict[int, bool] = field(default_factory=dict, init=False, repr=False, compare=False)
     _compression_rope: dict[int, tuple] = field(default_factory=dict, init=False, repr=False, compare=False)
     _snapshot: dict[str, Any] = field(default_factory=dict, init=False, repr=False, compare=False)
     _prepared_positions: dict[torch.device, torch.Tensor] = field(
@@ -234,6 +264,62 @@ class SharedCompressedPackedSequence:
     _indexer_segments: dict[int, tuple[tuple[int, int, int, int, int], ...]] = field(
         default_factory=dict, init=False, repr=False, compare=False
     )
+
+    _graph_blocks: dict[int, tuple[torch.Tensor, torch.Tensor]] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+    _prepared_maxima: dict[tuple[torch.device, int], torch.Tensor] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+    _prepared_sequences: dict[torch.device, torch.Tensor] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+    _tensor_geometry: bool = field(default=False, init=False, repr=False, compare=False)
+
+    def prepare_graph_geometry(self, device: torch.device, compress_ratios: tuple[int, ...]) -> None:
+        """Prepare CP1 graph inputs without changing the eager compact-bank path.
+
+        Host boundary planning runs once in the runtime adapter, before capture.
+        Capacity depends only on raw sequence length, not document lengths/count.
+        Complete blocks occupy a compact prefix; remaining slots are masked by
+        each query's document-local exclusive upper bound.
+        """
+        if self.local_query_start != 0 or self.local_query_length != self.global_sequence_length:
+            return
+        device = torch.device(device)
+        for ratio in sorted(set(compress_ratios)):
+            if ratio <= 1:
+                continue
+            cached = self._graph_blocks.get(ratio)
+            if cached is not None and cached[0].device == device:
+                continue
+            plan = document_compression_plan(self.boundaries(), ratio, self.local_query_length, 1, 0)
+            rows, starts = plan.indices(device)
+            capacity = self.local_query_length // ratio
+            rows = torch.cat((rows, rows.new_zeros(capacity * ratio - rows.numel())))
+            starts = torch.cat((starts, starts.new_zeros(capacity - starts.numel())))
+            self._graph_blocks[ratio] = (rows, starts)
+        self.segment_start_mask(device)
+
+    def router_metadata(self, device: torch.device) -> tuple[torch.Tensor, int]:
+        """Return logical document IDs and the router's sequence storage capacity.
+
+        The graph reserves at most one document per raw token. The existing
+        router loss averages only nonempty sequences, so unused capacity does
+        not change its value or gradients.
+        """
+        count = self.local_query_length if self._tensor_geometry else self.cu_seq_lens.numel() - 1
+        return self._prepared_sequences[torch.device(device)], count
+
+    def maximum_key_indices(self, device: torch.device, ratio: int) -> torch.Tensor:
+        """Return exclusive completed-key bounds in each query's own document."""
+        device = torch.device(device)
+        key = (device, ratio)
+        if key not in self._prepared_maxima:
+            self._prepared_maxima[key] = self.minimum_key_indices(device, ratio) + (
+                self.local_positions(device) - self.local_segment_starts(device) + 1
+            ) // ratio
+        return self._prepared_maxima[key]
 
     def prepare(self, device: torch.device, compress_ratios: tuple[int, ...]) -> SharedCompressedPackedSequence:
         """Prepare an owned boundary snapshot, reused until the input is mutated.
@@ -273,10 +359,18 @@ class SharedCompressedPackedSequence:
         """Populate caches on the owned snapshot, never on caller-owned boundaries."""
         starts = self.local_segment_starts(device)
         self._prepared_starts[device] = starts
+        if device not in self._prepared_sequences:
+            self._prepared_sequences[device] = torch.bucketize(
+                self.local_positions(device).squeeze(0), self.cu_seq_lens.to(device=device)[1:], right=True,
+            ).unsqueeze(0)
         for ratio in set(compress_ratios):
             self.validate_compression_ratio(ratio)
+            if not self._tensor_geometry:
+                self.compression_aligned(ratio)
             if ratio > 0 and (device, ratio) not in self._prepared_minima:
                 self._prepared_minima[(device, ratio)] = self.minimum_key_indices(device, ratio)
+            if ratio > 0:
+                self.maximum_key_indices(device, ratio)
 
     def local_positions(self, device: torch.device) -> torch.Tensor:
         """Return the immutable local interval's global token positions."""
@@ -296,6 +390,8 @@ class SharedCompressedPackedSequence:
 
     def boundaries(self) -> tuple[int, ...]:
         """Reuse the owned batch's host boundaries for routing across layers."""
+        if self._tensor_geometry:
+            raise ValueError("host document boundaries are unavailable in tensor-only packed graph inputs")
         if "boundaries" not in self._snapshot:
             self._snapshot["boundaries"] = tuple(self.cu_seq_lens.detach().cpu().tolist())
         return self._snapshot["boundaries"]
@@ -375,6 +471,20 @@ class SharedCompressedPackedSequence:
         if compress_ratio < 0:
             raise ValueError("compression ratio must be nonnegative")
 
+    def compression_aligned(self, ratio: int) -> bool:
+        """Cache document alignment before capture while keeping natural lengths valid."""
+        self.validate_compression_ratio(ratio)
+        if ratio <= 1:
+            return True
+        if self._tensor_geometry:
+            raise ValueError("host alignment is unavailable in tensor-only packed graph inputs")
+        if ratio not in self._compression_alignment:
+            self.validate_compression_ratio(ratio)
+            self._compression_alignment[ratio] = ratio <= 1 or all(
+                boundary % ratio == 0 for boundary in self.boundaries()
+            )
+        return self._compression_alignment[ratio]
+
     def block_plan(self, ratio: int, size: int, rank: int) -> Any:
         """Use the original contiguous compressor fast path when every group is aligned.
 
@@ -386,8 +496,13 @@ class SharedCompressedPackedSequence:
         Returns:
             Document-local block plan, or None when contiguous compression suffices.
         """
+        if self._tensor_geometry and ratio > 1:
+            if size != 1 or rank != 0:
+                raise ValueError("tensor compression geometry currently supports CP1 only")
+            rows, starts = self._graph_blocks[ratio]
+            return _TensorCompressionPlan(ratio, rows, starts)
         if ratio <= 1 or (self.local_query_length % ratio == 0
-                          and all(boundary % ratio == 0 for boundary in self.boundaries())):
+                          and self.compression_aligned(ratio)):
             return None
         return document_compression_plan(self.boundaries(), ratio, self.local_query_length, size, rank)
 
@@ -420,6 +535,63 @@ class SharedCompressedPackedSequence:
         return tuple((max(first, start)-first, start)
                      for start, end in zip(self.boundaries(), self.boundaries()[1:])
                      if max(first, start) < min(last, end))
+
+    def pytree_flatten(self) -> tuple[list[Any], tuple]:
+        """Expose prepared geometry as graph inputs, never as captured constants."""
+        if self._graph_blocks:
+            # Raw boundaries have a data-dependent count and are not used by the
+            # tensor path. Only prepared, fixed-schema geometry enters the graph.
+            return [self._prepared_starts, self._prepared_minima, self._prepared_positions,
+                    self._prepared_masks, self._graph_blocks, self._prepared_maxima,
+                    self._prepared_sequences], ("tensor",)
+        children = [self.cu_seq_lens, self._prepared_starts, self._prepared_minima,
+                    self._prepared_positions, self._prepared_masks]
+        context = (self.local_query_start, self.local_query_length, self.global_sequence_length,
+                   tuple(sorted(self._compression_alignment.items())))
+        return children, context
+
+    @classmethod
+    def pytree_unflatten(cls, children: Any, context: tuple) -> SharedCompressedPackedSequence:
+        """Reconstruct an owned snapshot without reading tensor data during tracing."""
+        if context == ("tensor",):
+            starts, minima, positions, masks, blocks, maxima, sequences = children
+            reference = next(iter(starts.values()))
+            length = reference.shape[-1]
+            sequence = cls(reference.new_empty(0), 0, length, length)
+            sequence._prepared_starts.update(starts)
+            sequence._prepared_minima.update(minima)
+            sequence._prepared_positions.update(positions)
+            sequence._prepared_masks.update(masks)
+            sequence._graph_blocks.update(blocks)
+            sequence._prepared_maxima.update(maxima)
+            sequence._prepared_sequences.update(sequences)
+            object.__setattr__(sequence, "_tensor_geometry", True)
+            sequence._mark_owned()
+            return sequence
+        boundaries, starts, minima, positions, masks = children
+        local_start, local_length, global_length, alignment = context
+        sequence = cls(boundaries, local_start, local_length, global_length)
+        sequence._prepared_starts.update(starts)
+        sequence._prepared_minima.update(minima)
+        sequence._prepared_positions.update(positions)
+        sequence._prepared_masks.update(masks)
+        sequence._compression_alignment.update(alignment)
+        sequence._mark_owned()
+        return sequence
+
+
+register_pytree_node(SharedCompressedPackedSequence, SharedCompressedPackedSequence.pytree_flatten,
+                    SharedCompressedPackedSequence.pytree_unflatten)
+
+
+def _query_chunk_ranges(sequence_length: int, chunk_size: int) -> tuple[tuple[int, int], ...]:
+    """Keep a single chunk symbolic instead of coercing its length through range."""
+    if sequence_length == 0:
+        return ()
+    if sequence_length <= chunk_size:
+        return ((0, sequence_length),)
+    return tuple((start, min(start + chunk_size, sequence_length))
+                 for start in range(0, sequence_length, chunk_size))
 
 
 def _rotate_half(tensor: torch.Tensor) -> torch.Tensor:
@@ -521,6 +693,7 @@ def compressed_causal_topk(
         minimum_key_indices: torch.Tensor | None = None,
         query_segments: tuple[tuple[int, int, int, int, int], ...] | None = None,
         use_fused: bool = False,
+        maximum_key_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Select compressed positions with V4.1's ratio-aware causal rule.
 
@@ -533,6 +706,8 @@ def compressed_causal_topk(
         query_segments: Local Q intersections and global compressed K prefixes.
         use_fused: Select LI V2 and raise if a nonempty call is unsupported.
             False explicitly selects the numerical reference.
+        maximum_key_indices: Optional [batch, query] exclusive document-local
+            upper bounds for reference selection; fused selection uses query_segments.
     """
     if compress_ratio <= 0:
         raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
@@ -552,6 +727,8 @@ def compressed_causal_topk(
     compressed_length = key.shape[1]
     if minimum_key_indices is not None and minimum_key_indices.shape != query.shape[:2]:
         raise ValueError("minimum_key_indices must have shape [batch, query]")
+    if maximum_key_indices is not None and maximum_key_indices.shape != query.shape[:2]:
+        raise ValueError("maximum_key_indices must have shape [batch, query]")
     top_k = min(sparse_count, compressed_length)
     if top_k <= 0 or sequence_length == 0:
         return torch.empty(
@@ -571,18 +748,18 @@ def compressed_causal_topk(
     visible_keys, minimum_key_indices = _causal_key_bounds(
         query, compress_ratio, query_offset, minimum_key_indices, query_segments,
     )
+    visible_keys = visible_keys.unsqueeze(0) if maximum_key_indices is None else maximum_key_indices
     key_fp32 = key.float().transpose(1, 2).unsqueeze(1)
     key_positions = torch.arange(compressed_length, device=query.device).view(1, 1, -1)
     selected_chunks = []
-    for start in range(0, sequence_length, query_chunk_size):
-        end = min(start + query_chunk_size, sequence_length)
+    for start, end in _query_chunk_ranges(sequence_length, query_chunk_size):
         # SAC may retain the matmul result; do not mutate its cached tensor.
         scores = torch.matmul(query[:, start:end].float(), key_fp32).relu()
         scores = (scores * merge_weight[:, start:end].float().unsqueeze(-1)).sum(dim=2)
         if reduce_sum is not None:
             scores = reduce_sum(scores)
-        visible = visible_keys[start:end]
-        scores.masked_fill_(key_positions >= visible.view(1, -1, 1), float("-inf"))
+        visible = visible_keys[:, start:end].unsqueeze(-1)
+        scores.masked_fill_(key_positions >= visible, float("-inf"))
         if minimum_key_indices is not None:
             minimum = minimum_key_indices[:, start:end].unsqueeze(-1)
             scores.masked_fill_(key_positions < minimum, float("-inf"))
@@ -592,6 +769,21 @@ def compressed_causal_topk(
         indices = indices.masked_fill(indices == compressed_length, -1)
         selected_chunks.append(indices.to(torch.int32))
     return torch.cat(selected_chunks, dim=1)
+
+
+def _candidate_block_scores(logits: torch.Tensor, block_size: int) -> torch.Tensor:
+    """Take block maxima with symbolic padding that also handles zero padding.
+
+    constant_pad_nd specializes on zero versus positive padding during symbolic
+    tracing. Explicit row selection keeps the exact ceil(width/block_size)
+    output contract without a guard on width modulo block_size.
+    """
+    width = logits.shape[-1]
+    capacity = ((width + block_size - 1) // block_size) * block_size
+    rows = torch.arange(capacity, device=logits.device)
+    scores = logits.index_select(-1, rows.clamp_max(width - 1))
+    scores = scores.masked_fill(rows >= width, float("-inf"))
+    return scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
 
 
 def select_candidate_blocks(
@@ -613,9 +805,7 @@ def select_candidate_blocks(
     width = logits.shape[-1]
     if width == 0:
         return torch.zeros_like(logits, dtype=torch.bool)
-    padding = -width % block_size
-    scores = torch.nn.functional.pad(logits, (0, padding), value=float("-inf"))
-    scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
+    scores = _candidate_block_scores(logits, block_size)
     num_blocks = scores.shape[-1]
     if isinstance(compress_lens, torch.Tensor):
         last = (compress_lens.to(device=logits.device) - 1) // block_size
@@ -648,9 +838,7 @@ def select_candidate_block_indices(
     width = logits.shape[-1]
     if width == 0:
         return torch.empty(*logits.shape[:-1], 0, dtype=torch.int32, device=logits.device)
-    padding = -width % block_size
-    scores = torch.nn.functional.pad(logits, (0, padding), value=float("-inf"))
-    scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
+    scores = _candidate_block_scores(logits, block_size)
     num_blocks = scores.shape[-1]
     if isinstance(compress_lens, torch.Tensor):
         last = (compress_lens.to(device=logits.device) - 1) // block_size
@@ -683,8 +871,7 @@ def compressed_causal_candidates(
     key_fp32 = key.float().transpose(1, 2).unsqueeze(1)
     key_positions = torch.arange(compressed_length, device=query.device).view(1, 1, -1)
     candidate_chunks = []
-    for start in range(0, sequence_length, query_chunk_size):
-        end = min(start + query_chunk_size, sequence_length)
+    for start, end in _query_chunk_ranges(sequence_length, query_chunk_size):
         scores = torch.matmul(query[:, start:end].float(), key_fp32).relu()
         scores = (scores * merge_weight[:, start:end].float().unsqueeze(-1)).sum(dim=2)
         if reduce_sum is not None:
@@ -753,8 +940,7 @@ def compressed_causal_topk_and_candidates(
     key_positions = torch.arange(compressed_length, device=query.device).view(1, 1, -1)
     selected_chunks = []
     candidate_chunks = []
-    for start in range(0, sequence_length, query_chunk_size):
-        end = min(start + query_chunk_size, sequence_length)
+    for start, end in _query_chunk_ranges(sequence_length, query_chunk_size):
         scores = torch.matmul(query[:, start:end].float(), key_fp32).relu()
         scores = (scores * merge_weight[:, start:end].float().unsqueeze(-1)).sum(dim=2)
         if reduce_sum is not None:
@@ -834,8 +1020,7 @@ def compressed_candidate_topk(
     block_offsets = torch.arange(block_size, device=query.device)
     batch_indices = torch.arange(batch_size, device=query.device).view(-1, 1, 1)
     selected_chunks = []
-    for start in range(0, sequence_length, query_chunk_size):
-        end = min(start + query_chunk_size, sequence_length)
+    for start, end in _query_chunk_ranges(sequence_length, query_chunk_size):
         blocks = candidate_blocks[:, start:end].long()
         block_positions = blocks.unsqueeze(-1) * block_size + block_offsets
         positions = block_positions.flatten(-2)
@@ -893,13 +1078,10 @@ class _SharedCompressedIndexerKLLoss(torch.autograd.Function):
         grad_merge_weight = torch.zeros_like(merge_weight, dtype=torch.float32)
 
         with torch.no_grad(), torch.autocast(device_type=index_query.device.type, enabled=False):
-            for start in range(0, sequence_length, query_chunk_size):
-                end = min(start + query_chunk_size, sequence_length)
+            for start, end in _query_chunk_ranges(sequence_length, query_chunk_size):
                 selected = topk_indices[:, start:end]
                 valid = selected >= 0
                 valid_rows = valid.any(dim=-1)
-                if not torch.any(valid_rows):
-                    continue
                 safe_indices = selected.clamp_min(0).long()
 
                 query_chunk = index_query[:, start:end].float()
@@ -935,7 +1117,9 @@ class _SharedCompressedIndexerKLLoss(torch.autograd.Function):
                 log_prediction = index_scores.log_softmax(dim=-1)
                 target_log = target.clamp_min(torch.finfo(torch.float32).tiny).log()
                 row_loss = (target * (target_log - log_prediction)).sum(dim=-1)
-                total_loss.add_(row_loss[valid_rows].sum() * (loss_coeff / denominator))
+                # Empty causal rows already have zero target and gradients.
+                # Mask their loss without data-dependent Python or indexing.
+                total_loss.add_(row_loss.masked_fill(~valid_rows, 0.0).sum() * (loss_coeff / denominator))
 
                 grad_scores = log_prediction.exp() * target.sum(-1, keepdim=True) - target
                 grad_scores.mul_(loss_coeff / denominator)
@@ -1123,6 +1307,7 @@ class SharedCompressedDSAIndexer(nn.Module):
             query_segments: tuple[tuple[int, int, int, int, int], ...] | None = None,
             block_plan: Any = None,
             key_position_embeddings: tuple | None = None,
+            maximum_key_indices: torch.Tensor | None = None,
     ) -> SharedCompressedIndexerOutput:
         """Project local queries and score them against global compressed keys.
 
@@ -1159,7 +1344,7 @@ class SharedCompressedDSAIndexer(nn.Module):
             key = key_handle.wait()
         topk_indices, candidate_blocks = self._run_selection(
             query, key, merge_weight, candidate_blocks, query_offset,
-            reduce_sum, minimum_key_indices, query_segments,
+            reduce_sum, minimum_key_indices, query_segments, maximum_key_indices,
         )
         return SharedCompressedIndexerOutput(
             topk_indices=topk_indices,
@@ -1185,6 +1370,7 @@ class SharedCompressedDSAIndexer(nn.Module):
             candidate_blocks: torch.Tensor | None, query_offset: int,
             reduce_sum: Callable[[torch.Tensor], torch.Tensor] | None,
             minimum_key_indices: torch.Tensor | None, query_segments: tuple | None,
+            maximum_key_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Select the requested implementation without changing candidate policies."""
         if self.use_fused and (self.is_candidate_source or self.uses_candidates):
@@ -1233,6 +1419,7 @@ class SharedCompressedDSAIndexer(nn.Module):
                 minimum_key_indices=minimum_key_indices,
                 query_segments=query_segments,
                 use_fused=self.use_fused,
+                maximum_key_indices=maximum_key_indices,
             )
         return topk_indices, candidate_blocks
 
@@ -1427,7 +1614,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             query_offset: int,
             global_sequence_length: int,
             device: torch.device,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, tuple]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, tuple | None]:
         """Validate packed document boundaries and derive local Q/K segments."""
         segment_starts = None
         minimum_key_indices = None
@@ -1457,9 +1644,10 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             if self.compress_ratio:
                 minimum_key_indices = packed_sequence.minimum_key_indices(device, self.compress_ratio)
             if (self.candidate_source_layer_idx is not None
-                    and any(boundary % ratio for boundary in packed_sequence.boundaries())):
+                    and not packed_sequence.compression_aligned(ratio)):
                 raise ValueError("candidate-pool packed attention still requires compression-aligned documents")
-            query_segments = packed_sequence.indexer_segments(ratio)
+            # Only fused kernels consume host intervals; reference masks stay live in FX.
+            query_segments = packed_sequence.indexer_segments(ratio) if self.use_fused_ops else None
         return segment_starts, minimum_key_indices, query_segments
 
     def _prepare_compression(
@@ -1524,9 +1712,10 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             tp_context: "SharedCompressedAttentionTPContext | None",
             query_offset: int,
             minimum_key_indices: torch.Tensor | None,
-            query_segments: tuple,
+            query_segments: tuple | None,
             block_plan: Any = None,
             key_position_embeddings: tuple | None = None,
+            maximum_key_indices: torch.Tensor | None = None,
     ) -> Any | None:
         """Run the indexer on index-source layers and publish its forward outputs."""
         if not self.is_index_source:
@@ -1557,6 +1746,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             query_segments=query_segments,
             block_plan=block_plan,
             key_position_embeddings=key_position_embeddings,
+            maximum_key_indices=maximum_key_indices,
         )
         if is_recomputing():
             # A recompute must not publish again: its consumers read the entries
@@ -1602,7 +1792,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             query: torch.Tensor,
             compressed_kv: torch.Tensor | None,
             tp_context: "SharedCompressedAttentionTPContext | None",
-            query_segments: tuple,
+            query_segments: tuple | None,
     ) -> torch.Tensor:
         """Auto-scale the query by the indexer KL loss when configured."""
         if (
@@ -1633,7 +1823,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
     def _run_sparse_attention(
             self, query: torch.Tensor, key_value: torch.Tensor, compressed_kv: torch.Tensor | None,
             topk_indices: torch.Tensor | None, query_offset: int, global_sequence_length: int,
-            segment_starts: torch.Tensor | None, query_segments: tuple, raw_document_starts: tuple = (),
+            segment_starts: torch.Tensor | None, query_segments: tuple | None, raw_document_starts: tuple = (),
     ) -> torch.Tensor:
         """Run the chosen implementation; unsupported explicit fusion always raises."""
         if self.use_fused_ops:
@@ -1722,7 +1912,8 @@ class SharedCompressedDSAAttentionBase(nn.Module):
         block_plan, key_positions = self._prepare_compression(
             packed_sequence, cp_context, position_embeddings, global_sequence_length, hidden_states.device,
         )
-        raw_document_starts = () if packed_sequence is None else packed_sequence.raw_document_starts()
+        raw_document_starts = (packed_sequence.raw_document_starts()
+                               if self.use_fused_ops and packed_sequence is not None else ())
         rope_type = "compress" if self.compress_ratio else "main"
         cos, sin = position_embeddings[rope_type]
         key_value, raw_kv_handle = self._project_raw_kv(hidden_states, cos, sin, cp_context)
@@ -1743,6 +1934,8 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             query_segments,
             block_plan,
             key_positions,
+            maximum_key_indices=(packed_sequence.maximum_key_indices(hidden_states.device, self.compress_ratio)
+                                 if packed_sequence is not None and self.compress_ratio else None),
         )
 
         if raw_kv_handle is not None:

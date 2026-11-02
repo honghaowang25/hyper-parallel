@@ -481,9 +481,12 @@ class BaseTrainer(Stateful, ABC):
             setattr(self, f"{split_name}_batch_sampler", batch_sampler)
 
     def attach_model_integration_data_pipeline(self) -> None:
-        """Attach the final data pipeline through one shared Trainer path."""
+        """Bind the final model configuration and attach the data pipeline."""
+        runtime_adapter = getattr(self.get_batch, "runtime_input_adapter", None)
+        if runtime_adapter is not None:
+            runtime_adapter.bind_model_config(self.model_config)
         self.model_integration.attach_data_pipeline(
-            runtime_adapter=getattr(self.get_batch, "runtime_input_adapter", None),
+            runtime_adapter=runtime_adapter,
             get_batch=self.get_batch,
             model_assets=tuple(self.model_assets),
         )
@@ -611,6 +614,14 @@ class BaseTrainer(Stateful, ABC):
             current_token_counts=current_token_counts,
             step_token_counts=step_token_counts,
         )
+        # Joint-graph replay bypasses Python forward-side metric assignments.
+        # Thread router metrics through explicit outputs instead of reading
+        # the FakeTensors left on modules by the capture-time forward.
+        moe_monitor = getattr(self, "moe_monitor", None)
+        if moe_monitor is not None:
+            aux_loss = moe_monitor.last_mean_aux_loss_tensor
+            if aux_loss is not None:
+                loss_dict["router_aux_loss"] = aux_loss
         return loss, loss_dict
 
     def _init_callbacks(self):

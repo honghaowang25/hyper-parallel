@@ -20,7 +20,10 @@ from unittest.mock import patch
 
 import torch
 from torch import nn
+from torch.fx.experimental.proxy_tensor import make_fx
+from torch.utils._pytree import tree_flatten, tree_unflatten
 
+from hyper_parallel.compile.tracer.graph_tracer import run_traced_graph, trace_model_graph
 from hyper_parallel.components.functional import sparse_flash_mla as attention_ops
 from hyper_parallel.distributed.context_parallel.compressed_document import document_compression_plan
 from hyper_parallel.components.modules import shared_compressed_dsa_attention as attention
@@ -49,6 +52,173 @@ def _source(index_source=False):
         for name, value in values.items():
             setattr(module.indexer, name, value)
     return module
+
+
+class TestIndexerKLGraph(unittest.TestCase):
+    """Compare the captured analytic KL backward with an independent autograd formula."""
+
+    @staticmethod
+    def _inputs():
+        generator = torch.Generator().manual_seed(71)
+        return (torch.randn(1, 4, 2, 3, generator=generator),
+                torch.randn(1, 3, 3, generator=generator),
+                torch.randn(1, 4, 2, generator=generator),
+                torch.randn(1, 2, 4, 5, generator=generator),
+                torch.randn(1, 3, 5, generator=generator),
+                torch.randn(2, generator=generator))
+
+    @staticmethod
+    def _oracle(query, key, weights, teacher_query, teacher_key, sinks, indices):
+        safe = indices.clamp_min(0).long()
+        valid = indices >= 0
+        batch_index = torch.arange(query.shape[0]).view(-1, 1, 1)
+        selected = key[batch_index, safe]
+        dots = torch.einsum("bshd,bskd->bshk", query, selected).relu()
+        logits = (dots * weights.unsqueeze(-1)).sum(2).masked_fill(~valid, -1.0e9)
+        with torch.no_grad():
+            selected_teacher = teacher_key[batch_index, safe]
+            teacher_scores = torch.einsum("bhsd,bskd->bhsk", teacher_query, selected_teacher) * 0.5
+            teacher_scores = teacher_scores.masked_fill(~valid.unsqueeze(1), -1.0e9)
+            sink_logits = sinks.view(1, -1, 1, 1).expand(*teacher_scores.shape[:-1], 1)
+            target = torch.cat((teacher_scores, sink_logits), -1).softmax(-1)[..., :-1]
+            target = target.masked_fill(~valid.unsqueeze(1), 0.).mean(1)
+            target = target / target.sum(-1, keepdim=True).clamp_min(torch.finfo(torch.float32).tiny)
+        loss = (target * (target.clamp_min(torch.finfo(torch.float32).tiny).log() - logits.log_softmax(-1))).sum(-1)
+        return loss.masked_fill(~valid.any(-1), 0.).mean() * 0.001
+
+    def test_analytic_loss_and_gradients_match_autograd_with_empty_rows(self) -> None:
+        """Mixed and fully empty causal rows retain finite losses and exact zero contributions."""
+        for indices in (torch.tensor([[[-1, -1], [0, -1], [1, 2], [0, 2]]]),
+                        torch.full((1, 4, 2), -1)):
+            with self.subTest(indices=indices.tolist()):
+                values = self._inputs()
+                actual_args = [value.clone().requires_grad_() for value in values[:3]]
+                expected_args = [value.clone().requires_grad_() for value in values[:3]]
+                teacher = [value.clone().requires_grad_() for value in values[3:]]
+                actual = attention.shared_compressed_indexer_kl_loss(
+                    *actual_args, *teacher[:2], indices, teacher[2], attention_scale=0.5, loss_coeff=0.001,
+                )
+                expected = self._oracle(*expected_args, *teacher, indices)
+                actual.backward()
+                expected.backward()
+                torch.testing.assert_close(actual, expected, rtol=2e-5, atol=1e-8)
+                for observed, reference in zip(actual_args, expected_args):
+                    torch.testing.assert_close(observed.grad, reference.grad, rtol=2e-5, atol=1e-8)
+                    self.assertTrue(bool(torch.isfinite(observed.grad).all()))
+                for value in teacher:
+                    self.assertIsNone(value.grad)
+
+    def test_joint_graph_replays_changed_validity_without_recompiling(self) -> None:
+        """The same forward/backward graph handles both valid and entirely masked rows."""
+        values = self._inputs()
+
+        class IndexerLoss(nn.Module):
+            def __init__(self) -> None:
+                """Initialize the regression fixture."""
+                super().__init__()
+                self.query = nn.Parameter(values[0])
+                self.key = nn.Parameter(values[1])
+                self.weights = nn.Parameter(values[2])
+
+            def forward(self, indices: torch.Tensor) -> torch.Tensor:
+                """Evaluate the graph regression fixture."""
+                return attention.shared_compressed_indexer_kl_loss(
+                    self.query, self.key, self.weights, values[3], values[4], indices, values[5],
+                    attention_scale=0.5, loss_coeff=0.001,
+                )
+
+        model = IndexerLoss()
+        first = torch.tensor([[[-1, -1], [0, -1], [1, 2], [0, 2]]])
+        graph = trace_model_graph(model, lambda module, indices: module(indices), {"indices": first})
+        for indices in (torch.full_like(first, -1), first):
+            actual, grads, _ = run_traced_graph(graph, model, {"indices": indices})
+            expected = self._oracle(model.query, model.key, model.weights, *values[3:], indices)
+            expected_grads = torch.autograd.grad(expected, tuple(model.parameters()))
+            torch.testing.assert_close(actual, expected, rtol=2e-5, atol=1e-8)
+            for observed, reference in zip(grads, expected_grads):
+                torch.testing.assert_close(observed, reference, rtol=2e-5, atol=1e-8)
+
+
+class TestPackedSequenceGraphInputs(unittest.TestCase):
+    """Keep packed boundary changes visible when a captured graph is replayed."""
+
+    @staticmethod
+    def _prepared(boundaries: list[int]) -> attention.SharedCompressedPackedSequence:
+        packed = attention.SharedCompressedPackedSequence(torch.tensor(boundaries), 0, 8, 8)
+        packed = packed.prepare(torch.device("cpu"), (0, 1, 2))
+        packed.segment_start_mask(torch.device("cpu"))
+        return packed
+
+    def test_graph_replay_consumes_new_boundary_tensors(self) -> None:
+        """Replay identical shapes with different documents and compare eager masks."""
+        first = self._prepared([0, 4, 8])
+        second = self._prepared([0, 2, 8])
+        first_flat, first_spec = tree_flatten(first)
+        second_flat, second_spec = tree_flatten(second)
+        self.assertEqual(first_spec, second_spec)
+
+        def masks(*leaves: torch.Tensor) -> tuple[torch.Tensor, ...]:
+            """Evaluate the graph regression fixture."""
+            packed = tree_unflatten(list(leaves), first_spec).prepare(torch.device("cpu"), (0, 1, 2))
+            return (packed.local_segment_starts(torch.device("cpu")),
+                    packed.minimum_key_indices(torch.device("cpu"), 2),
+                    packed.segment_start_mask(torch.device("cpu")))
+
+        graph = make_fx(masks, tracing_mode="fake")(*first_flat)
+        for actual, expected in zip(graph(*second_flat), masks(*second_flat)):
+            torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(graph(*second_flat)[0], torch.tensor([[0, 0, 2, 2, 2, 2, 2, 2]]))
+
+    def test_graph_rejects_changed_compression_alignment(self) -> None:
+        """A new compression branch must not silently reuse the aligned captured graph."""
+        model = nn.Linear(1, 1)
+        first = self._prepared([0, 4, 8])
+        second = self._prepared([0, 3, 8])
+
+        def train_fn(_model: nn.Module, packed: attention.SharedCompressedPackedSequence) -> tuple:
+            """Evaluate the graph regression fixture."""
+            values = packed.local_segment_starts(torch.device("cpu")).float().unsqueeze(-1)
+            return _model(values).sum(), {}
+
+        graph = trace_model_graph(model, train_fn, {"packed": first})
+        with self.assertRaisesRegex(ValueError, "different pytree structure"):
+            run_traced_graph(graph, model, {"packed": second})
+
+    def test_mutation_after_unflatten_invalidates_owned_snapshot(self) -> None:
+        """A reconstructed snapshot retains normal version-counter invalidation."""
+        leaves, spec = tree_flatten(self._prepared([0, 4, 8]))
+        restored = tree_unflatten(leaves, spec)
+        restored.cu_seq_lens[1] = 2
+        updated = restored.prepare(torch.device("cpu"), (2,))
+        torch.testing.assert_close(updated.local_segment_starts(torch.device("cpu")),
+                                   torch.tensor([[0, 0, 2, 2, 2, 2, 2, 2]]))
+
+    def test_alignment_is_cached_without_rejecting_natural_documents(self) -> None:
+        """Keep upstream natural-document compression and expose its control-flow metadata."""
+        packed = attention.SharedCompressedPackedSequence(torch.tensor([0, 3, 8]), 0, 8, 8)
+        prepared = packed.prepare(torch.device("cpu"), (2,))
+        leaves, spec = tree_flatten(prepared)
+        restored = tree_unflatten(leaves, spec)
+        self.assertFalse(restored.compression_aligned(2))
+        self.assertIsNotNone(prepared.block_plan(2, 1, 0))
+
+    def test_chunk_ranges_preserve_empty_and_multichunk_coverage(self) -> None:
+        """Match Python range coverage at zero and across full or partial chunks."""
+        for length in (0, 16, 256, 300, 600):
+            expected = tuple((start, min(start + 256, length)) for start in range(0, length, 256))
+            self.assertEqual(attention._query_chunk_ranges(length, 256), expected)  # pylint: disable=protected-access
+
+    def test_symbolic_indexer_replays_a_different_sequence_length(self) -> None:
+        """Changing a short sequence retains every query instead of truncating the graph."""
+        def select(query: torch.Tensor, key: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+            """Evaluate the graph regression fixture."""
+            return attention.compressed_causal_topk(query, key, weights, compress_ratio=2,
+                                                   sparse_count=512, query_chunk_size=256)
+
+        initial = (torch.randn(1, 16, 2, 4), torch.randn(1, 8, 4), torch.randn(1, 16, 2))
+        updated = (torch.randn(1, 32, 2, 4), torch.randn(1, 16, 4), torch.randn(1, 32, 2))
+        graph = make_fx(select, tracing_mode="symbolic")(*initial)
+        torch.testing.assert_close(graph(*updated), select(*updated))
 
 
 class TestSharedCompressedFusionPolicy(unittest.TestCase):

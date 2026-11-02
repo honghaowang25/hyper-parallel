@@ -41,6 +41,34 @@ class TestLoggingCallback(unittest.TestCase):
             step_env_metrics={"training/total_loss": 2.5}, tqdm_callback=None,
         )
 
+    def test_graph_metric_does_not_read_capture_time_module_attributes(self) -> None:
+        """Explicit graph outputs take precedence over stale forward-side state."""
+        monitor = Mock()
+        callback = LoggingCallback(self._trainer(monitor))
+        with (
+            patch.object(type(monitor), "last_mean_aux_loss", new_callable=PropertyMock, create=True) as read,
+            patch("hyper_parallel.trainer.callbacks.logging_callback.logger.info") as log,
+        ):
+            read.side_effect = RuntimeError("capture-time FakeTensor")
+            callback.on_step_end(TrainerState(global_step=2), loss=2.5,
+                                 loss_dict={"router_aux_loss": torch.tensor(1.75)}, grad_norm=1.0)
+        read.assert_not_called()
+        self.assertIn("training/router_aux_loss=1.75", log.call_args.args[1])
+
+    def test_tensor_metric_is_traceable_and_replays_new_values(self) -> None:
+        """The graph captures the metric calculation without converting to Python."""
+        layers = [SimpleNamespace(last_aux_loss=None) for _ in range(2)]
+        monitor = MoEMonitorCallback(SimpleNamespace(modules=lambda: iter(layers)))
+
+        def metric(values: torch.Tensor) -> torch.Tensor:
+            """Evaluate the graph regression fixture."""
+            for index, layer in enumerate(layers):
+                layer.last_aux_loss = values[index]
+            return monitor.last_mean_aux_loss_tensor
+
+        graph = torch.fx.experimental.proxy_tensor.make_fx(metric)(torch.tensor([1., 2.]))
+        torch.testing.assert_close(graph(torch.tensor([3., 5.])), torch.tensor(4.))
+
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")
     def test_callback_import_does_not_load_model_runtime(self) -> None:
